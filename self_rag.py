@@ -8,15 +8,21 @@ Run:
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
+from typing import Any, TypedDict
 
 import ollama
 from dotenv import load_dotenv
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_groq import ChatGroq
 from langchain_ollama import OllamaEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langgraph.graph import END, START, StateGraph
+from pydantic import BaseModel
 from pypdf import PdfReader
 
 load_dotenv()
@@ -36,6 +42,10 @@ EMBED_MODEL = "mxbai-embed-large"  # 1024-dim Ollama embedding model
 # mxbai-embed-large is trained to see this prefix on *queries* (never on documents).
 QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
 EMBED_BATCH = 64  # chunks embedded per call to Ollama / written per call to Chroma
+
+DEFAULT_GROQ_MODEL = "openai/gpt-oss-20b"
+GROQ_MODEL = os.getenv("GROQ_MODEL") or DEFAULT_GROQ_MODEL  # override via env var
+TOP_K = 4  # chunks fetched per similarity search
 
 
 class SelfRagError(RuntimeError):
@@ -173,6 +183,103 @@ def ingest(force: bool = False, folder: Path = DOCUMENTS_DIR, store: Chroma | No
 
 
 # ---------------------------------------------------------------------------
+# 4. LLM (Groq) & structured output
+# ---------------------------------------------------------------------------
+
+
+def get_llm() -> ChatGroq:
+    """Groq chat model (temperature 0). Needs GROQ_API_KEY in the environment / .env."""
+    if not os.getenv("GROQ_API_KEY"):
+        raise SelfRagError("GROQ_API_KEY is not set. Add it to your .env file (see .env.example).")
+    return ChatGroq(model=GROQ_MODEL, temperature=0)
+
+
+def structured(llm: BaseChatModel, schema: type[BaseModel]) -> Any:
+    """LLM that returns a validated `schema` instance.
+
+    Uses Groq's native json_schema mode, falling back to forced tool calling
+    if that call fails. Output is never parsed from free text.
+    """
+    primary = llm.with_structured_output(schema, method="json_schema")
+    fallback = llm.with_structured_output(schema, method="function_calling")
+    return primary.with_fallbacks([fallback])
+
+
+# ---------------------------------------------------------------------------
+# 5. State & schemas
+# ---------------------------------------------------------------------------
+
+
+class GraphState(TypedDict, total=False):
+    """Everything the graph passes between nodes."""
+
+    question: str
+    docs: list[Document]  # retrieved chunks
+    final_answer: str
+
+
+# ---------------------------------------------------------------------------
+# 6. Nodes
+# ---------------------------------------------------------------------------
+
+GENERATE_PROMPT = """Answer the question using only the context below. If the context does not \
+contain the answer, say you could not find it in the documents.
+
+Context:
+{context}
+
+Question: {question}"""
+
+
+def format_source(doc: Document) -> str:
+    """'file.pdf, p. 12' (PDF pages are stored 0-based, shown 1-based)."""
+    name = Path(doc.metadata.get("source", "unknown")).name
+    page = doc.metadata.get("page")
+    return f"{name}, p. {page + 1}" if isinstance(page, int) else name
+
+
+class Nodes:
+    """Graph nodes bound to one LLM and one vector store."""
+
+    def __init__(self, llm: BaseChatModel, store: Chroma) -> None:
+        self.llm = llm
+        self.store = store
+
+    def retrieve(self, state: GraphState) -> GraphState:
+        """Top-k similarity search over the Chroma collection."""
+        docs = self.store.similarity_search(state["question"], k=TOP_K)
+        return {"docs": docs}
+
+    def generate(self, state: GraphState) -> GraphState:
+        """Answer from the retrieved chunks."""
+        context = "\n\n---\n\n".join(d.page_content for d in state["docs"])
+        prompt = GENERATE_PROMPT.format(context=context, question=state["question"])
+        return {"final_answer": str(self.llm.invoke(prompt).content)}
+
+
+# ---------------------------------------------------------------------------
+# 7. Graph
+# ---------------------------------------------------------------------------
+
+
+def build_graph(llm: BaseChatModel | None = None, store: Chroma | None = None) -> Any:
+    """Assemble and compile the LangGraph state machine."""
+    nodes = Nodes(llm or get_llm(), store or get_vector_store())
+    graph = StateGraph(GraphState)
+    graph.add_node("retrieve", nodes.retrieve)
+    graph.add_node("generate", nodes.generate)
+    graph.add_edge(START, "retrieve")
+    graph.add_edge("retrieve", "generate")
+    graph.add_edge("generate", END)
+    return graph.compile()
+
+
+def ask(question: str, graph: Any | None = None) -> GraphState:
+    """Run one question through the graph and return the final state."""
+    return (graph or build_graph()).invoke({"question": question})
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -182,7 +289,18 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
     p_ingest = sub.add_parser("ingest", help="embed documents/ into Chroma")
     p_ingest.add_argument("--force", action="store_true", help="rebuild even if already ingested")
+    p_ask = sub.add_parser("ask", help="ask a question")
+    p_ask.add_argument("question")
     return parser
+
+
+def print_result(result: GraphState) -> None:
+    """Pretty-print the answer and its sources."""
+    print("\n=== Answer ===")
+    print(result["final_answer"])
+    sources = sorted({format_source(d) for d in result.get("docs", [])})
+    if sources:
+        print("\nSources: " + "; ".join(sources))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -190,6 +308,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "ingest":
             ingest(force=args.force)
+        elif args.command == "ask":
+            print_result(ask(args.question))
     except SelfRagError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
