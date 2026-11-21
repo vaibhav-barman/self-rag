@@ -15,14 +15,16 @@ from typing import Any, Literal, TypedDict
 
 import ollama
 from dotenv import load_dotenv
+from groq import BadRequestError
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
+from langchain_core.exceptions import OutputParserException
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_groq import ChatGroq
 from langchain_ollama import OllamaEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langgraph.graph import END, START, StateGraph
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 from pypdf import PdfReader
 
 load_dotenv()
@@ -46,8 +48,11 @@ EMBED_BATCH = 64  # chunks embedded per call to Ollama / written per call to Chr
 DEFAULT_GROQ_MODEL = "openai/gpt-oss-20b"
 GROQ_MODEL = os.getenv("GROQ_MODEL") or DEFAULT_GROQ_MODEL  # override via env var
 TOP_K = 4  # chunks fetched per similarity search
-MAX_CONCURRENCY = 3  # parallel Groq calls per batch (keeps us inside free-tier rate limits)
+MAX_CONCURRENCY = 2  # parallel Groq calls per batch (keeps us inside free-tier rate limits)
+GROQ_MAX_RETRIES = 8  # client retries on 429 / transient errors (it honours Groq's retry-after)
+REASONING_EFFORT = "low"  # gpt-oss reasoning depth; "low" cuts tokens (free tier is 8k tokens/min)
 MAX_REVISIONS = 2  # max rounds of "rewrite using only what the context supports"
+MAX_RETRIES = 2  # max times we rewrite the question and retrieve again
 
 
 class SelfRagError(RuntimeError):
@@ -193,18 +198,27 @@ def get_llm() -> ChatGroq:
     """Groq chat model (temperature 0). Needs GROQ_API_KEY in the environment / .env."""
     if not os.getenv("GROQ_API_KEY"):
         raise SelfRagError("GROQ_API_KEY is not set. Add it to your .env file (see .env.example).")
-    return ChatGroq(model=GROQ_MODEL, temperature=0)
+    return ChatGroq(
+        model=GROQ_MODEL,
+        temperature=0,
+        max_retries=GROQ_MAX_RETRIES,
+        reasoning_effort=REASONING_EFFORT,
+    )
 
 
 def structured(llm: BaseChatModel, schema: type[BaseModel]) -> Any:
     """LLM that returns a validated `schema` instance.
 
     Uses Groq's native json_schema mode, falling back to forced tool calling
-    if that call fails. Output is never parsed from free text.
+    only when the model itself fails to produce valid output. Rate-limit errors are
+    deliberately NOT caught here: the client retries them with backoff, and falling
+    back would only hide the real error.
     """
     primary = llm.with_structured_output(schema, method="json_schema")
     fallback = llm.with_structured_output(schema, method="function_calling")
-    return primary.with_fallbacks([fallback])
+    return primary.with_fallbacks(
+        [fallback], exceptions_to_handle=(OutputParserException, ValidationError, BadRequestError)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -248,6 +262,30 @@ class SupportGrade(BaseModel):
     )
 
 
+class UsefulnessGrade(BaseModel):
+    """ISUSE: does the answer actually address the question?"""
+
+    useful: bool = Field(
+        description="True if the answer directly and substantively addresses the question. "
+        "False if it dodges, only says the information was not found, or is off-topic."
+    )
+    reason: str = Field(description="One short sentence explaining the verdict.")
+
+
+class RewrittenQuery(BaseModel):
+    """A better search query for the vector store."""
+
+    query: str = Field(description="The rewritten, self-contained retrieval query.")
+
+
+class BestAnswer(TypedDict):
+    """Best answer seen across attempts, kept for the limited-context fallback."""
+
+    answer: str
+    rank: int  # SUPPORT_RANK of the answer (-1 for a direct, unsupported-by-docs answer)
+    sources: list[str]
+
+
 class GraphState(TypedDict, total=False):
     """Everything the graph passes between nodes."""
 
@@ -264,6 +302,13 @@ class GraphState(TypedDict, total=False):
     selected_index: int  # which candidate (and chunk) was chosen
     selected_answer: str
     support: str  # ISSUP verdict of the selected answer
+    useful: bool  # ISUSE verdict
+    usefulness_reason: str
+    retries: int  # question rewrites used so far
+    rewritten_question: str  # latest retrieval query (empty until a rewrite happens)
+    best: BestAnswer  # best not-useful answer so far (for the fallback)
+    limited_context: bool  # True if we gave up and returned the best effort
+    sources: list[str]  # "file.pdf, p. N" for the chunk behind the final answer
     final_answer: str
 
 
@@ -329,9 +374,30 @@ Current answer:
 Unsupported claims to remove:
 {claims}"""
 
+USEFUL_PROMPT = """Decide whether the answer is useful for the question. It is useful only if it \
+directly and substantively addresses what was asked. It is NOT useful if it dodges, is \
+off-topic, or merely says the information could not be found.
+
+Question: {question}
+
+Answer:
+{answer}"""
+
+REWRITE_PROMPT = """The search over a document collection did not produce a good answer. Rewrite \
+the question as a better retrieval query: expand abbreviations, add the key technical terms and \
+synonyms a textbook would use, and make it self-contained. Do not answer it.
+
+Original question: {question}
+Previous query: {previous}
+Why the last attempt failed: {feedback}"""
+
 NO_CONTEXT_ANSWER = (
     "I could not find relevant information about this in the documents, so I can't answer "
     "it reliably from them."
+)
+LIMITED_CONTEXT_NOTE = (
+    "\n\n_Note: limited context. The documents did not fully cover this question, "
+    "so this answer may be incomplete or only partly relevant._"
 )
 
 
@@ -352,24 +418,30 @@ class Nodes:
         self.decider = structured(llm, RetrievalDecision)
         self.relevance_grader = structured(llm, RelevanceGrade)
         self.support_grader = structured(llm, SupportGrade)
+        self.usefulness_grader = structured(llm, UsefulnessGrade)
+        self.rewriter = structured(llm, RewrittenQuery)
 
     def decide_retrieval(self, state: GraphState) -> GraphState:
-        """Retrieve-or-not decision (Self-RAG's `Retrieve` token)."""
+        """Retrieve-or-not decision (Self-RAG's `Retrieve` token). Also zeroes the counters."""
         decision = self.decider.invoke(DECIDE_PROMPT.format(question=state["question"]))
         return {
             "needs_retrieval": decision.should_retrieve,
             "retrieval_reason": decision.reason,
+            "retries": 0,
+            "revisions": 0,
+            "rewritten_question": "",
+            "limited_context": False,
         }
 
     def generate_direct(self, state: GraphState) -> GraphState:
         """Answer from general knowledge, without touching the documents."""
-        answer = self.llm.invoke(DIRECT_PROMPT.format(question=state["question"]))
-        return {"final_answer": str(answer.content), "docs": []}
+        answer = str(self.llm.invoke(DIRECT_PROMPT.format(question=state["question"])).content)
+        return {"final_answer": answer, "selected_answer": answer, "docs": [], "sources": []}
 
     def retrieve(self, state: GraphState) -> GraphState:
-        """Top-k similarity search over the Chroma collection."""
-        docs = self.store.similarity_search(state["question"], k=TOP_K)
-        return {"docs": docs}
+        """Top-k similarity search, using the rewritten query when there is one."""
+        query = state.get("rewritten_question") or state["question"]
+        return {"docs": self.store.similarity_search(query, k=TOP_K)}
 
     def is_relevant(self, state: GraphState) -> GraphState:
         """ISREL: grade every retrieved chunk and keep only the relevant ones."""
@@ -389,7 +461,13 @@ class Nodes:
             for d in state["relevant_docs"]
         ]
         replies = self.llm.batch(prompts, config=self.batch_cfg)
-        return {"answers": [str(r.content) for r in replies], "revisions": 0}
+        return {
+            "answers": [str(r.content) for r in replies],
+            "revisions": 0,
+            # fresh attempt: drop verdicts left over from an earlier retrieval round
+            "support_verdicts": ["no_support"] * len(replies),
+            "unsupported_claims": [[] for _ in replies],
+        }
 
     def is_supported(self, state: GraphState) -> GraphState:
         """ISSUP: grade each candidate against its own chunk (re-grading only weak ones)."""
@@ -434,11 +512,48 @@ class Nodes:
             "selected_answer": answer,
             "support": verdicts[best],
             "final_answer": answer,
+            "sources": [format_source(state["relevant_docs"][best])],
         }
 
-    def no_context(self, _state: GraphState) -> GraphState:
-        """Honest fallback when no retrieved chunk is relevant."""
-        return {"final_answer": NO_CONTEXT_ANSWER}
+    def is_useful(self, state: GraphState) -> GraphState:
+        """ISUSE: does the selected answer address the question? Remember it if not."""
+        answer = state["selected_answer"]
+        grade = self.usefulness_grader.invoke(
+            USEFUL_PROMPT.format(question=state["question"], answer=answer)
+        )
+        update: GraphState = {"useful": grade.useful, "usefulness_reason": grade.reason}
+        if not grade.useful:
+            rank = SUPPORT_RANK.get(state.get("support", ""), -1)
+            if "best" not in state or rank >= state["best"]["rank"]:
+                update["best"] = {"answer": answer, "rank": rank, "sources": state["sources"]}
+        return update
+
+    def rewrite_question(self, state: GraphState) -> GraphState:
+        """Turn the question into a better retrieval query, then retrieve again."""
+        feedback = state.get("usefulness_reason") or "no retrieved passage was relevant"
+        rewritten = self.rewriter.invoke(
+            REWRITE_PROMPT.format(
+                question=state["question"],
+                previous=state.get("rewritten_question") or state["question"],
+                feedback=feedback,
+            )
+        )
+        return {
+            "rewritten_question": rewritten.query,
+            "retries": state["retries"] + 1,
+            "needs_retrieval": True,  # a direct answer that failed escalates to the documents
+        }
+
+    def limited_context(self, state: GraphState) -> GraphState:
+        """Retries exhausted: return the best answer found, honestly flagged."""
+        best = state.get("best")
+        if best is None:
+            return {"final_answer": NO_CONTEXT_ANSWER, "sources": [], "limited_context": True}
+        return {
+            "final_answer": best["answer"] + LIMITED_CONTEXT_NOTE,
+            "sources": best["sources"],
+            "limited_context": True,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -451,9 +566,13 @@ def route_after_decision(state: GraphState) -> Literal["retrieve", "generate_dir
     return "retrieve" if state["needs_retrieval"] else "generate_direct"
 
 
-def route_after_relevance(state: GraphState) -> Literal["generate_from_context", "no_context"]:
-    """Generate if at least one chunk is relevant, otherwise give the honest fallback."""
-    return "generate_from_context" if state["relevant_docs"] else "no_context"
+def route_after_relevance(
+    state: GraphState,
+) -> Literal["generate_from_context", "rewrite_question", "limited_context"]:
+    """Generate if any chunk is relevant; otherwise rewrite the query, or give up honestly."""
+    if state["relevant_docs"]:
+        return "generate_from_context"
+    return "rewrite_question" if state["retries"] < MAX_RETRIES else "limited_context"
 
 
 def route_after_support(state: GraphState) -> Literal["revise_answer", "select_answer"]:
@@ -462,6 +581,13 @@ def route_after_support(state: GraphState) -> Literal["revise_answer", "select_a
     if not grounded and state["revisions"] < MAX_REVISIONS:
         return "revise_answer"
     return "select_answer"
+
+
+def route_after_usefulness(state: GraphState) -> Literal["__end__", "rewrite_question", "limited_context"]:
+    """Finish if useful; otherwise retry with a rewritten query, or give up honestly."""
+    if state["useful"]:
+        return END
+    return "rewrite_question" if state["retries"] < MAX_RETRIES else "limited_context"
 
 
 # ---------------------------------------------------------------------------
@@ -481,17 +607,21 @@ def build_graph(llm: BaseChatModel | None = None, store: Chroma | None = None) -
     graph.add_node("is_supported", nodes.is_supported)
     graph.add_node("revise_answer", nodes.revise_answer)
     graph.add_node("select_answer", nodes.select_answer)
-    graph.add_node("no_context", nodes.no_context)
+    graph.add_node("is_useful", nodes.is_useful)
+    graph.add_node("rewrite_question", nodes.rewrite_question)
+    graph.add_node("limited_context", nodes.limited_context)
     graph.add_edge(START, "decide_retrieval")
     graph.add_conditional_edges("decide_retrieval", route_after_decision)
-    graph.add_edge("generate_direct", END)
+    graph.add_edge("generate_direct", "is_useful")
     graph.add_edge("retrieve", "is_relevant")
     graph.add_conditional_edges("is_relevant", route_after_relevance)
     graph.add_edge("generate_from_context", "is_supported")
     graph.add_conditional_edges("is_supported", route_after_support)
     graph.add_edge("revise_answer", "is_supported")
-    graph.add_edge("select_answer", END)
-    graph.add_edge("no_context", END)
+    graph.add_edge("select_answer", "is_useful")
+    graph.add_conditional_edges("is_useful", route_after_usefulness)
+    graph.add_edge("rewrite_question", "retrieve")
+    graph.add_edge("limited_context", END)
     return graph.compile()
 
 
@@ -522,13 +652,14 @@ def print_result(result: GraphState) -> None:
         print(f"Relevant chunks: {sum(result['relevance'])}/{len(result['relevance'])}")
     if "support" in result:
         print(f"Support: {result['support']} (revisions: {result['revisions']})")
+    if "useful" in result:
+        print(f"Useful: {result['useful']} ({result.get('usefulness_reason', '')})")
+    if result["retries"]:
+        print(f"Retries: {result['retries']}, last query: {result['rewritten_question']!r}")
     print("\n=== Answer ===")
     print(result["final_answer"])
-    chosen = result.get("selected_index")
-    docs = [result["relevant_docs"][chosen]] if chosen is not None else []
-    sources = sorted({format_source(d) for d in docs})
-    if sources:
-        print("\nSources: " + "; ".join(sources))
+    if result["sources"]:
+        print("\nSources: " + "; ".join(result["sources"]))
 
 
 def main(argv: list[str] | None = None) -> int:
