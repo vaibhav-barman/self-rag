@@ -1,0 +1,23 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Secrets (never commit)
+.env
+.env.*
+!.env.example
+
+# Local vector store (rebuilt by `uv run self_rag.py ingest`)
+chroma_db/
+
+# OS / editor noise
+.DS_Store
+.idea/
+.vscode/
