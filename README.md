@@ -104,14 +104,21 @@ Ingest is idempotent: it skips if `./chroma_db` already has vectors. Chunks are 
 |---------|-------|---------|
 | `GROQ_API_KEY` | `.env` | required |
 | `GROQ_MODEL` | `.env` | `openai/gpt-oss-20b` |
+| `GROQ_FALLBACK_MODEL` | `.env` | `openai/gpt-oss-120b` |
 | `TOP_K`, `MAX_REVISIONS`, `MAX_RETRIES`, `MAX_CONCURRENCY` | constants in `self_rag.py` | 4, 2, 2, 2 |
 
 ### Groq free-tier notes
 
 The free tier allows about 8,000 tokens per minute for this model, and one full Self-RAG pass makes
 roughly a dozen LLM calls. So a question can take 20 to 40 seconds while the client waits out
-429 responses (it retries with backoff, up to `GROQ_MAX_RETRIES`). Reasoning effort is set to
-`low` and batches run with a concurrency cap of 2 to stay inside the limit.
+429 responses (it retries with backoff). Reasoning effort is set to `low` and batches run with a
+concurrency cap of 2 to stay inside the limit.
+
+**Model fallback.** Each call goes to `GROQ_MODEL` first. If it still fails after the client's
+retries (a rate limit, an API error, or invalid structured output), that same call is retried on
+`GROQ_FALLBACK_MODEL` (`openai/gpt-oss-120b`), which has its own rate-limit budget. The primary
+only retries 3 times before handing over; the fallback waits longer. If both fail, you get a short
+error message instead of a traceback.
 
 ## Sample questions
 

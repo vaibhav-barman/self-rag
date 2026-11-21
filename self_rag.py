@@ -19,7 +19,6 @@ from typing import Any, Literal, TypedDict
 import groq
 import ollama
 from dotenv import load_dotenv
-from groq import BadRequestError
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_core.exceptions import OutputParserException
@@ -52,9 +51,13 @@ EMBED_BATCH = 64  # chunks embedded per call to Ollama / written per call to Chr
 
 DEFAULT_GROQ_MODEL = "openai/gpt-oss-20b"
 GROQ_MODEL = os.getenv("GROQ_MODEL") or DEFAULT_GROQ_MODEL  # override via env var
+# Larger sibling model, used for a call only when the primary model's call fails.
+DEFAULT_FALLBACK_MODEL = "openai/gpt-oss-120b"
+GROQ_FALLBACK_MODEL = os.getenv("GROQ_FALLBACK_MODEL") or DEFAULT_FALLBACK_MODEL
 TOP_K = 4  # chunks fetched per similarity search
 MAX_CONCURRENCY = 2  # parallel Groq calls per batch (keeps us inside free-tier rate limits)
-GROQ_MAX_RETRIES = 8  # client retries on 429 / transient errors (it honours Groq's retry-after)
+PRIMARY_MAX_RETRIES = 3  # client retries (honouring retry-after) before handing over to the fallback
+FALLBACK_MAX_RETRIES = 8  # the fallback is the last resort, so it waits out rate limits longer
 REASONING_EFFORT = "low"  # gpt-oss reasoning depth; "low" cuts tokens (free tier is 8k tokens/min)
 MAX_REVISIONS = 2  # max rounds of "rewrite using only what the context supports"
 MAX_RETRIES = 2  # max times we rewrite the question and retrieve again
@@ -68,8 +71,8 @@ class SelfRagError(RuntimeError):
 def friendly_errors() -> Iterator[None]:
     """Turn Groq / Ollama failures into short SelfRagError messages.
 
-    Rate limits (429) are retried with backoff by the Groq client (GROQ_MAX_RETRIES);
-    only a limit that survives all those retries reaches this handler.
+    Rate limits (429) are retried with backoff by the Groq client, then the call moves to
+    the fallback model; only a failure that survives both reaches this handler.
     """
     try:
         yield
@@ -228,31 +231,51 @@ def ingest(force: bool = False, folder: Path = DOCUMENTS_DIR, store: Chroma | No
 # ---------------------------------------------------------------------------
 
 
-def get_llm() -> ChatGroq:
+def get_llm(model: str = GROQ_MODEL, max_retries: int = PRIMARY_MAX_RETRIES) -> ChatGroq:
     """Groq chat model (temperature 0). Needs GROQ_API_KEY in the environment / .env."""
     if not os.getenv("GROQ_API_KEY"):
         raise SelfRagError("GROQ_API_KEY is not set. Add it to your .env file (see .env.example).")
     return ChatGroq(
-        model=GROQ_MODEL,
+        model=model,
         temperature=0,
-        max_retries=GROQ_MAX_RETRIES,
+        max_retries=max_retries,
         reasoning_effort=REASONING_EFFORT,
     )
 
 
-def structured(llm: BaseChatModel, schema: type[BaseModel]) -> Any:
-    """LLM that returns a validated `schema` instance.
+def get_fallback_llm() -> ChatGroq:
+    """The fallback Groq model (`GROQ_FALLBACK_MODEL`, default gpt-oss-120b)."""
+    return get_llm(GROQ_FALLBACK_MODEL, FALLBACK_MAX_RETRIES)
 
-    Uses Groq's native json_schema mode, falling back to forced tool calling
-    only when the model itself fails to produce valid output. Rate-limit errors are
-    deliberately NOT caught here: the client retries them with backoff, and falling
-    back would only hide the real error.
+
+# Failures that move a call from the primary model to the fallback model.
+FALLBACK_ERRORS = (groq.APIError, OutputParserException, ValidationError)
+
+
+def with_model_fallback(primary: BaseChatModel, fallback: BaseChatModel | None) -> Any:
+    """Plain-text LLM: try `primary`, and on an API error retry the same call on `fallback`."""
+    if fallback is None:
+        return primary
+    return primary.with_fallbacks([fallback], exceptions_to_handle=FALLBACK_ERRORS)
+
+
+def structured(
+    llm: BaseChatModel, schema: type[BaseModel], fallback_llm: BaseChatModel | None = None
+) -> Any:
+    """LLM that returns a validated `schema` instance (never parsed from free text).
+
+    Order of attempts: the primary model with Groq's native json_schema mode, then the
+    fallback model with json_schema, then the fallback model with forced tool calling.
+    Without a fallback model it uses tool calling on the primary instead. Rate limits are
+    first retried with backoff by the Groq client, so a fallback only happens after that.
     """
-    primary = llm.with_structured_output(schema, method="json_schema")
-    fallback = llm.with_structured_output(schema, method="function_calling")
-    return primary.with_fallbacks(
-        [fallback], exceptions_to_handle=(OutputParserException, ValidationError, BadRequestError)
-    )
+    attempts = [llm.with_structured_output(schema, method="json_schema")]
+    if fallback_llm is not None:
+        attempts.append(fallback_llm.with_structured_output(schema, method="json_schema"))
+        attempts.append(fallback_llm.with_structured_output(schema, method="function_calling"))
+    else:
+        attempts.append(llm.with_structured_output(schema, method="function_calling"))
+    return attempts[0].with_fallbacks(attempts[1:], exceptions_to_handle=FALLBACK_ERRORS)
 
 
 # ---------------------------------------------------------------------------
@@ -448,15 +471,17 @@ def format_source(doc: Document) -> str:
 class Nodes:
     """Graph nodes bound to one LLM and one vector store."""
 
-    def __init__(self, llm: BaseChatModel, store: Chroma) -> None:
-        self.llm = llm
+    def __init__(
+        self, llm: BaseChatModel, store: Chroma, fallback_llm: BaseChatModel | None = None
+    ) -> None:
+        self.llm = with_model_fallback(llm, fallback_llm)
         self.store = store
         self.batch_cfg = {"max_concurrency": MAX_CONCURRENCY}
-        self.decider = structured(llm, RetrievalDecision)
-        self.relevance_grader = structured(llm, RelevanceGrade)
-        self.support_grader = structured(llm, SupportGrade)
-        self.usefulness_grader = structured(llm, UsefulnessGrade)
-        self.rewriter = structured(llm, RewrittenQuery)
+        self.decider = structured(llm, RetrievalDecision, fallback_llm)
+        self.relevance_grader = structured(llm, RelevanceGrade, fallback_llm)
+        self.support_grader = structured(llm, SupportGrade, fallback_llm)
+        self.usefulness_grader = structured(llm, UsefulnessGrade, fallback_llm)
+        self.rewriter = structured(llm, RewrittenQuery, fallback_llm)
 
     def decide_retrieval(self, state: GraphState) -> GraphState:
         """Retrieve-or-not decision (Self-RAG's `Retrieve` token). Also zeroes the counters."""
@@ -640,13 +665,21 @@ def route_after_usefulness(state: GraphState) -> Literal["__end__", "rewrite_que
 # ---------------------------------------------------------------------------
 
 
-def build_graph(llm: BaseChatModel | None = None, store: Chroma | None = None) -> Any:
-    """Assemble and compile the LangGraph state machine."""
-    llm = llm or get_llm()
+def build_graph(
+    llm: BaseChatModel | None = None,
+    store: Chroma | None = None,
+    fallback_llm: BaseChatModel | None = None,
+) -> Any:
+    """Assemble and compile the LangGraph state machine.
+
+    When `llm` is not given, builds the primary and fallback Groq models from config.
+    """
+    if llm is None:
+        llm, fallback_llm = get_llm(), get_fallback_llm()
     store = store or get_vector_store()
     if collection_size(store) == 0:
         raise SelfRagError("The vector store is empty. Ingest your documents first (ingest).")
-    nodes = Nodes(llm, store)
+    nodes = Nodes(llm, store, fallback_llm)
     graph = StateGraph(GraphState)
     graph.add_node("decide_retrieval", nodes.decide_retrieval)
     graph.add_node("generate_direct", nodes.generate_direct)
