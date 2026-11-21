@@ -8,11 +8,15 @@ Run:
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Literal, TypedDict
 
+import groq
 import ollama
 from dotenv import load_dotenv
 from groq import BadRequestError
@@ -28,6 +32,7 @@ from pydantic import BaseModel, Field, ValidationError
 from pypdf import PdfReader
 
 load_dotenv()
+logger = logging.getLogger("self_rag")
 
 # ---------------------------------------------------------------------------
 # 1. Config
@@ -59,6 +64,33 @@ class SelfRagError(RuntimeError):
     """A user-facing error with a clear message (no traceback needed)."""
 
 
+@contextmanager
+def friendly_errors() -> Iterator[None]:
+    """Turn Groq / Ollama failures into short SelfRagError messages.
+
+    Rate limits (429) are retried with backoff by the Groq client (GROQ_MAX_RETRIES);
+    only a limit that survives all those retries reaches this handler.
+    """
+    try:
+        yield
+    except SelfRagError:
+        raise
+    except groq.AuthenticationError as exc:
+        raise SelfRagError("Groq rejected GROQ_API_KEY. Check the key in your .env file.") from exc
+    except groq.RateLimitError as exc:
+        raise SelfRagError(
+            "Groq rate limit still exceeded after several retries (free tier: ~8k tokens/min). "
+            "Wait a minute and try again."
+        ) from exc
+    except groq.APIConnectionError as exc:
+        raise SelfRagError("Cannot reach the Groq API. Check your internet connection.") from exc
+    except (ConnectionError, ollama.ResponseError) as exc:
+        raise SelfRagError(
+            f"Ollama stopped responding ({exc}). Make sure it is running and "
+            f"'{EMBED_MODEL}' is installed."
+        ) from exc
+
+
 # ---------------------------------------------------------------------------
 # 2. Embeddings & vector store
 # ---------------------------------------------------------------------------
@@ -79,9 +111,10 @@ def check_ollama() -> None:
     try:
         installed = [m.model for m in ollama.Client().list().models]
     except Exception as exc:  # connection refused, etc.
+        host = os.getenv("OLLAMA_HOST") or "http://localhost:11434"
         raise SelfRagError(
-            "Cannot reach Ollama at http://localhost:11434. Start it (open the Ollama "
-            "app or run `ollama serve`) and try again."
+            f"Cannot reach Ollama at {host}. Start it (open the Ollama app or run "
+            "`ollama serve`) and try again."
         ) from exc
     if not any(name and name.split(":")[0] == EMBED_MODEL for name in installed):
         raise SelfRagError(
@@ -170,23 +203,24 @@ def ingest(force: bool = False, folder: Path = DOCUMENTS_DIR, store: Chroma | No
 
     Returns the number of vectors in the collection afterwards.
     """
-    store = store or get_vector_store()
-    existing = collection_size(store)
-    if existing and not force:
-        print(f"Collection already has {existing} vectors; skipping (use --force to rebuild).")
-        return existing
-    if existing:
-        print(f"--force: deleting {existing} existing vectors")
-        store.reset_collection()
+    with friendly_errors():
+        store = store or get_vector_store()
+        existing = collection_size(store)
+        if existing and not force:
+            print(f"Collection already has {existing} vectors; skipping (use --force to rebuild).")
+            return existing
+        if existing:
+            print(f"--force: deleting {existing} existing vectors")
+            store.reset_collection()
 
-    print(f"Loading documents from {folder}/")
-    chunks = split_documents(load_documents(folder))
-    for start in range(0, len(chunks), EMBED_BATCH):
-        store.add_documents(chunks[start : start + EMBED_BATCH])
-        print(f"  embedded {min(start + EMBED_BATCH, len(chunks))}/{len(chunks)}")
-    total = collection_size(store)
-    print(f"Done. Collection '{store._collection.name}' now holds {total} vectors.")
-    return total
+        print(f"Loading documents from {folder}/")
+        chunks = split_documents(load_documents(folder))
+        for start in range(0, len(chunks), EMBED_BATCH):
+            store.add_documents(chunks[start : start + EMBED_BATCH])
+            print(f"  embedded {min(start + EMBED_BATCH, len(chunks))}/{len(chunks)}")
+        total = collection_size(store)
+        print(f"Done. Collection '{store._collection.name}' now holds {total} vectors.")
+        return total
 
 
 # ---------------------------------------------------------------------------
@@ -424,6 +458,7 @@ class Nodes:
     def decide_retrieval(self, state: GraphState) -> GraphState:
         """Retrieve-or-not decision (Self-RAG's `Retrieve` token). Also zeroes the counters."""
         decision = self.decider.invoke(DECIDE_PROMPT.format(question=state["question"]))
+        logger.info("decide_retrieval: retrieve=%s (%s)", decision.should_retrieve, decision.reason)
         return {
             "needs_retrieval": decision.should_retrieve,
             "retrieval_reason": decision.reason,
@@ -441,6 +476,7 @@ class Nodes:
     def retrieve(self, state: GraphState) -> GraphState:
         """Top-k similarity search, using the rewritten query when there is one."""
         query = state.get("rewritten_question") or state["question"]
+        logger.info("retrieve: query=%r", query)
         return {"docs": self.store.similarity_search(query, k=TOP_K)}
 
     def is_relevant(self, state: GraphState) -> GraphState:
@@ -452,6 +488,7 @@ class Nodes:
         grades = self.relevance_grader.batch(prompts, config=self.batch_cfg)
         verdicts = [g.relevant for g in grades]
         kept = [d for d, ok in zip(docs, verdicts) if ok]
+        logger.info("is_relevant: %d/%d chunks relevant %s", len(kept), len(docs), verdicts)
         return {"relevance": verdicts, "relevant_docs": kept}
 
     def generate_from_context(self, state: GraphState) -> GraphState:
@@ -483,6 +520,7 @@ class Nodes:
         ]
         for i, grade in zip(todo, self.support_grader.batch(prompts, config=self.batch_cfg)):
             verdicts[i], claims[i] = grade.verdict, grade.unsupported_claims
+        logger.info("is_supported: %s", verdicts)
         return {"support_verdicts": verdicts, "unsupported_claims": claims}
 
     def revise_answer(self, state: GraphState) -> GraphState:
@@ -500,6 +538,7 @@ class Nodes:
         ]
         for i, reply in zip(todo, self.llm.batch(prompts, config=self.batch_cfg)):
             answers[i] = str(reply.content)
+        logger.info("revise_answer: round %d, revised %d answer(s)", state["revisions"] + 1, len(todo))
         return {"answers": answers, "revisions": state["revisions"] + 1}
 
     def select_answer(self, state: GraphState) -> GraphState:
@@ -521,6 +560,7 @@ class Nodes:
         grade = self.usefulness_grader.invoke(
             USEFUL_PROMPT.format(question=state["question"], answer=answer)
         )
+        logger.info("is_useful: %s (%s)", grade.useful, grade.reason)
         update: GraphState = {"useful": grade.useful, "usefulness_reason": grade.reason}
         if not grade.useful:
             rank = SUPPORT_RANK.get(state.get("support", ""), -1)
@@ -538,6 +578,7 @@ class Nodes:
                 feedback=feedback,
             )
         )
+        logger.info("rewrite_question: retry %d -> %r", state["retries"] + 1, rewritten.query)
         return {
             "rewritten_question": rewritten.query,
             "retries": state["retries"] + 1,
@@ -547,6 +588,7 @@ class Nodes:
     def limited_context(self, state: GraphState) -> GraphState:
         """Retries exhausted: return the best answer found, honestly flagged."""
         best = state.get("best")
+        logger.info("limited_context: retries exhausted, best answer found=%s", best is not None)
         if best is None:
             return {"final_answer": NO_CONTEXT_ANSWER, "sources": [], "limited_context": True}
         return {
@@ -631,7 +673,8 @@ def build_graph(llm: BaseChatModel | None = None, store: Chroma | None = None) -
 
 def ask(question: str, graph: Any | None = None) -> GraphState:
     """Run one question through the graph and return the final state."""
-    return (graph or build_graph()).invoke({"question": question})
+    with friendly_errors():
+        return (graph or build_graph()).invoke({"question": question})
 
 
 # ---------------------------------------------------------------------------
@@ -646,6 +689,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_ingest.add_argument("--force", action="store_true", help="rebuild even if already ingested")
     p_ask = sub.add_parser("ask", help="ask a question")
     p_ask.add_argument("question")
+    parser.add_argument("-v", "--verbose", action="store_true", help="log each graph step")
     return parser
 
 
@@ -668,6 +712,12 @@ def print_result(result: GraphState) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    logging.basicConfig(
+        level=logging.INFO if args.verbose else logging.WARNING,
+        format="%(levelname)s %(name)s: %(message)s",
+    )
+    for noisy in ("httpx", "httpcore", "groq", "chromadb"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
     try:
         if args.command == "ingest":
             ingest(force=args.force)
