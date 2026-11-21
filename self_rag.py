@@ -46,6 +46,7 @@ EMBED_BATCH = 64  # chunks embedded per call to Ollama / written per call to Chr
 DEFAULT_GROQ_MODEL = "openai/gpt-oss-20b"
 GROQ_MODEL = os.getenv("GROQ_MODEL") or DEFAULT_GROQ_MODEL  # override via env var
 TOP_K = 4  # chunks fetched per similarity search
+MAX_CONCURRENCY = 3  # parallel Groq calls per batch (keeps us inside free-tier rate limits)
 
 
 class SelfRagError(RuntimeError):
@@ -220,6 +221,14 @@ class RetrievalDecision(BaseModel):
     reason: str = Field(description="One short sentence explaining the decision.")
 
 
+class RelevanceGrade(BaseModel):
+    """ISREL: is this chunk relevant to the question?"""
+
+    relevant: bool = Field(
+        description="True if the passage contains information that helps answer the question."
+    )
+
+
 class GraphState(TypedDict, total=False):
     """Everything the graph passes between nodes."""
 
@@ -227,6 +236,10 @@ class GraphState(TypedDict, total=False):
     needs_retrieval: bool
     retrieval_reason: str
     docs: list[Document]  # retrieved chunks
+    relevance: list[bool]  # ISREL verdict for each chunk in `docs`
+    relevant_docs: list[Document]  # chunks that passed ISREL
+    answers: list[str]  # one candidate answer per relevant chunk
+    selected_answer: str
     final_answer: str
 
 
@@ -249,13 +262,27 @@ DIRECT_PROMPT = """Answer the question concisely from your general knowledge.
 
 Question: {question}"""
 
-GENERATE_PROMPT = """Answer the question using only the context below. If the context does not \
-contain the answer, say you could not find it in the documents.
+RELEVANCE_PROMPT = """Decide whether the passage contains information that helps answer the \
+question. Mark it relevant only if it actually bears on the question, not merely if it shares \
+keywords.
 
-Context:
+Question: {question}
+
+Passage:
+{passage}"""
+
+GENERATE_PROMPT = """Answer the question using only the passage below. Do not add outside \
+knowledge. If the passage does not contain the answer, say so.
+
+Passage:
 {context}
 
 Question: {question}"""
+
+NO_CONTEXT_ANSWER = (
+    "I could not find relevant information about this in the documents, so I can't answer "
+    "it reliably from them."
+)
 
 
 def format_source(doc: Document) -> str:
@@ -271,7 +298,9 @@ class Nodes:
     def __init__(self, llm: BaseChatModel, store: Chroma) -> None:
         self.llm = llm
         self.store = store
+        self.batch_cfg = {"max_concurrency": MAX_CONCURRENCY}
         self.decider = structured(llm, RetrievalDecision)
+        self.relevance_grader = structured(llm, RelevanceGrade)
 
     def decide_retrieval(self, state: GraphState) -> GraphState:
         """Retrieve-or-not decision (Self-RAG's `Retrieve` token)."""
@@ -291,11 +320,34 @@ class Nodes:
         docs = self.store.similarity_search(state["question"], k=TOP_K)
         return {"docs": docs}
 
-    def generate(self, state: GraphState) -> GraphState:
-        """Answer from the retrieved chunks."""
-        context = "\n\n---\n\n".join(d.page_content for d in state["docs"])
-        prompt = GENERATE_PROMPT.format(context=context, question=state["question"])
-        return {"final_answer": str(self.llm.invoke(prompt).content)}
+    def is_relevant(self, state: GraphState) -> GraphState:
+        """ISREL: grade every retrieved chunk and keep only the relevant ones."""
+        question, docs = state["question"], state["docs"]
+        prompts = [
+            RELEVANCE_PROMPT.format(question=question, passage=d.page_content) for d in docs
+        ]
+        grades = self.relevance_grader.batch(prompts, config=self.batch_cfg)
+        verdicts = [g.relevant for g in grades]
+        kept = [d for d, ok in zip(docs, verdicts) if ok]
+        return {"relevance": verdicts, "relevant_docs": kept}
+
+    def generate_from_context(self, state: GraphState) -> GraphState:
+        """One candidate answer per relevant chunk, each using only that chunk."""
+        prompts = [
+            GENERATE_PROMPT.format(context=d.page_content, question=state["question"])
+            for d in state["relevant_docs"]
+        ]
+        replies = self.llm.batch(prompts, config=self.batch_cfg)
+        return {"answers": [str(r.content) for r in replies]}
+
+    def select_answer(self, state: GraphState) -> GraphState:
+        """Pick the answer to return (first candidate for now)."""
+        answer = state["answers"][0]
+        return {"selected_answer": answer, "final_answer": answer}
+
+    def no_context(self, _state: GraphState) -> GraphState:
+        """Honest fallback when no retrieved chunk is relevant."""
+        return {"final_answer": NO_CONTEXT_ANSWER}
 
 
 # ---------------------------------------------------------------------------
@@ -306,6 +358,11 @@ class Nodes:
 def route_after_decision(state: GraphState) -> Literal["retrieve", "generate_direct"]:
     """Retrieve only if the decision node said the documents are needed."""
     return "retrieve" if state["needs_retrieval"] else "generate_direct"
+
+
+def route_after_relevance(state: GraphState) -> Literal["generate_from_context", "no_context"]:
+    """Generate if at least one chunk is relevant, otherwise give the honest fallback."""
+    return "generate_from_context" if state["relevant_docs"] else "no_context"
 
 
 # ---------------------------------------------------------------------------
@@ -320,12 +377,18 @@ def build_graph(llm: BaseChatModel | None = None, store: Chroma | None = None) -
     graph.add_node("decide_retrieval", nodes.decide_retrieval)
     graph.add_node("generate_direct", nodes.generate_direct)
     graph.add_node("retrieve", nodes.retrieve)
-    graph.add_node("generate", nodes.generate)
+    graph.add_node("is_relevant", nodes.is_relevant)
+    graph.add_node("generate_from_context", nodes.generate_from_context)
+    graph.add_node("select_answer", nodes.select_answer)
+    graph.add_node("no_context", nodes.no_context)
     graph.add_edge(START, "decide_retrieval")
     graph.add_conditional_edges("decide_retrieval", route_after_decision)
     graph.add_edge("generate_direct", END)
-    graph.add_edge("retrieve", "generate")
-    graph.add_edge("generate", END)
+    graph.add_edge("retrieve", "is_relevant")
+    graph.add_conditional_edges("is_relevant", route_after_relevance)
+    graph.add_edge("generate_from_context", "select_answer")
+    graph.add_edge("select_answer", END)
+    graph.add_edge("no_context", END)
     return graph.compile()
 
 
@@ -352,9 +415,11 @@ def build_parser() -> argparse.ArgumentParser:
 def print_result(result: GraphState) -> None:
     """Pretty-print the answer and its sources."""
     print(f"\nRetrieve? {'yes' if result['needs_retrieval'] else 'no'} ({result['retrieval_reason']})")
+    if "relevance" in result:
+        print(f"Relevant chunks: {sum(result['relevance'])}/{len(result['relevance'])}")
     print("\n=== Answer ===")
     print(result["final_answer"])
-    sources = sorted({format_source(d) for d in result.get("docs", [])})
+    sources = sorted({format_source(d) for d in result.get("relevant_docs", [])})
     if sources:
         print("\nSources: " + "; ".join(sources))
 
