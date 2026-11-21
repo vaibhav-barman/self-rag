@@ -11,7 +11,7 @@ import argparse
 import os
 import sys
 from pathlib import Path
-from typing import Any, TypedDict
+from typing import Any, Literal, TypedDict
 
 import ollama
 from dotenv import load_dotenv
@@ -22,7 +22,7 @@ from langchain_groq import ChatGroq
 from langchain_ollama import OllamaEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langgraph.graph import END, START, StateGraph
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from pypdf import PdfReader
 
 load_dotenv()
@@ -210,10 +210,22 @@ def structured(llm: BaseChatModel, schema: type[BaseModel]) -> Any:
 # ---------------------------------------------------------------------------
 
 
+class RetrievalDecision(BaseModel):
+    """Does this question need the external documents?"""
+
+    should_retrieve: bool = Field(
+        description="True if the question needs facts from the document collection; "
+        "False if it can be answered from general knowledge."
+    )
+    reason: str = Field(description="One short sentence explaining the decision.")
+
+
 class GraphState(TypedDict, total=False):
     """Everything the graph passes between nodes."""
 
     question: str
+    needs_retrieval: bool
+    retrieval_reason: str
     docs: list[Document]  # retrieved chunks
     final_answer: str
 
@@ -221,6 +233,21 @@ class GraphState(TypedDict, total=False):
 # ---------------------------------------------------------------------------
 # 6. Nodes
 # ---------------------------------------------------------------------------
+
+DECIDE_PROMPT = """You decide whether a question needs a private document collection. The \
+collection contains technical books on: database internals and modern databases, network \
+programming (client/server, sockets), and software development practices.
+
+Retrieve (should_retrieve=true) when the question is about those subjects, asks for specific \
+facts, definitions or details likely found in such books, or refers to "the documents".
+Do not retrieve (should_retrieve=false) for greetings, simple arithmetic, common general \
+knowledge, or topics unrelated to the collection.
+
+Question: {question}"""
+
+DIRECT_PROMPT = """Answer the question concisely from your general knowledge.
+
+Question: {question}"""
 
 GENERATE_PROMPT = """Answer the question using only the context below. If the context does not \
 contain the answer, say you could not find it in the documents.
@@ -244,6 +271,20 @@ class Nodes:
     def __init__(self, llm: BaseChatModel, store: Chroma) -> None:
         self.llm = llm
         self.store = store
+        self.decider = structured(llm, RetrievalDecision)
+
+    def decide_retrieval(self, state: GraphState) -> GraphState:
+        """Retrieve-or-not decision (Self-RAG's `Retrieve` token)."""
+        decision = self.decider.invoke(DECIDE_PROMPT.format(question=state["question"]))
+        return {
+            "needs_retrieval": decision.should_retrieve,
+            "retrieval_reason": decision.reason,
+        }
+
+    def generate_direct(self, state: GraphState) -> GraphState:
+        """Answer from general knowledge, without touching the documents."""
+        answer = self.llm.invoke(DIRECT_PROMPT.format(question=state["question"]))
+        return {"final_answer": str(answer.content), "docs": []}
 
     def retrieve(self, state: GraphState) -> GraphState:
         """Top-k similarity search over the Chroma collection."""
@@ -258,7 +299,17 @@ class Nodes:
 
 
 # ---------------------------------------------------------------------------
-# 7. Graph
+# 7. Routing
+# ---------------------------------------------------------------------------
+
+
+def route_after_decision(state: GraphState) -> Literal["retrieve", "generate_direct"]:
+    """Retrieve only if the decision node said the documents are needed."""
+    return "retrieve" if state["needs_retrieval"] else "generate_direct"
+
+
+# ---------------------------------------------------------------------------
+# 8. Graph
 # ---------------------------------------------------------------------------
 
 
@@ -266,9 +317,13 @@ def build_graph(llm: BaseChatModel | None = None, store: Chroma | None = None) -
     """Assemble and compile the LangGraph state machine."""
     nodes = Nodes(llm or get_llm(), store or get_vector_store())
     graph = StateGraph(GraphState)
+    graph.add_node("decide_retrieval", nodes.decide_retrieval)
+    graph.add_node("generate_direct", nodes.generate_direct)
     graph.add_node("retrieve", nodes.retrieve)
     graph.add_node("generate", nodes.generate)
-    graph.add_edge(START, "retrieve")
+    graph.add_edge(START, "decide_retrieval")
+    graph.add_conditional_edges("decide_retrieval", route_after_decision)
+    graph.add_edge("generate_direct", END)
     graph.add_edge("retrieve", "generate")
     graph.add_edge("generate", END)
     return graph.compile()
@@ -296,6 +351,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def print_result(result: GraphState) -> None:
     """Pretty-print the answer and its sources."""
+    print(f"\nRetrieve? {'yes' if result['needs_retrieval'] else 'no'} ({result['retrieval_reason']})")
     print("\n=== Answer ===")
     print(result["final_answer"])
     sources = sorted({format_source(d) for d in result.get("docs", [])})
