@@ -47,6 +47,7 @@ DEFAULT_GROQ_MODEL = "openai/gpt-oss-20b"
 GROQ_MODEL = os.getenv("GROQ_MODEL") or DEFAULT_GROQ_MODEL  # override via env var
 TOP_K = 4  # chunks fetched per similarity search
 MAX_CONCURRENCY = 3  # parallel Groq calls per batch (keeps us inside free-tier rate limits)
+MAX_REVISIONS = 2  # max rounds of "rewrite using only what the context supports"
 
 
 class SelfRagError(RuntimeError):
@@ -229,6 +230,24 @@ class RelevanceGrade(BaseModel):
     )
 
 
+Support = Literal["fully_supported", "partially_supported", "no_support"]
+SUPPORT_RANK: dict[str, int] = {"fully_supported": 2, "partially_supported": 1, "no_support": 0}
+
+
+class SupportGrade(BaseModel):
+    """ISSUP: is the answer grounded in the passage it was generated from?"""
+
+    verdict: Support = Field(
+        description="fully_supported: every claim is stated in the passage. "
+        "partially_supported: some claims are, some are not. "
+        "no_support: the answer is not backed by the passage."
+    )
+    unsupported_claims: list[str] = Field(
+        default_factory=list,
+        description="Claims in the answer that the passage does not support (empty if none).",
+    )
+
+
 class GraphState(TypedDict, total=False):
     """Everything the graph passes between nodes."""
 
@@ -239,7 +258,12 @@ class GraphState(TypedDict, total=False):
     relevance: list[bool]  # ISREL verdict for each chunk in `docs`
     relevant_docs: list[Document]  # chunks that passed ISREL
     answers: list[str]  # one candidate answer per relevant chunk
+    support_verdicts: list[str]  # ISSUP verdict per candidate answer
+    unsupported_claims: list[list[str]]  # unsupported claims per candidate answer
+    revisions: int  # revision rounds used so far
+    selected_index: int  # which candidate (and chunk) was chosen
     selected_answer: str
+    support: str  # ISSUP verdict of the selected answer
     final_answer: str
 
 
@@ -279,6 +303,32 @@ Passage:
 
 Question: {question}"""
 
+SUPPORT_PROMPT = """Check whether the answer is grounded in the passage. Judge only against the \
+passage, not against your own knowledge.
+
+Passage:
+{passage}
+
+Question: {question}
+
+Answer:
+{answer}"""
+
+REVISE_PROMPT = """Rewrite the answer so it contains only information stated in the passage. \
+Remove or correct every unsupported claim. If the passage does not answer the question, say so \
+plainly.
+
+Passage:
+{passage}
+
+Question: {question}
+
+Current answer:
+{answer}
+
+Unsupported claims to remove:
+{claims}"""
+
 NO_CONTEXT_ANSWER = (
     "I could not find relevant information about this in the documents, so I can't answer "
     "it reliably from them."
@@ -301,6 +351,7 @@ class Nodes:
         self.batch_cfg = {"max_concurrency": MAX_CONCURRENCY}
         self.decider = structured(llm, RetrievalDecision)
         self.relevance_grader = structured(llm, RelevanceGrade)
+        self.support_grader = structured(llm, SupportGrade)
 
     def decide_retrieval(self, state: GraphState) -> GraphState:
         """Retrieve-or-not decision (Self-RAG's `Retrieve` token)."""
@@ -338,12 +389,52 @@ class Nodes:
             for d in state["relevant_docs"]
         ]
         replies = self.llm.batch(prompts, config=self.batch_cfg)
-        return {"answers": [str(r.content) for r in replies]}
+        return {"answers": [str(r.content) for r in replies], "revisions": 0}
+
+    def is_supported(self, state: GraphState) -> GraphState:
+        """ISSUP: grade each candidate against its own chunk (re-grading only weak ones)."""
+        docs, answers = state["relevant_docs"], state["answers"]
+        verdicts = list(state.get("support_verdicts", ["no_support"] * len(answers)))
+        claims = [list(c) for c in state.get("unsupported_claims", [[]] * len(answers))]
+        todo = [i for i, v in enumerate(verdicts) if v != "fully_supported"]
+        prompts = [
+            SUPPORT_PROMPT.format(
+                passage=docs[i].page_content, question=state["question"], answer=answers[i]
+            )
+            for i in todo
+        ]
+        for i, grade in zip(todo, self.support_grader.batch(prompts, config=self.batch_cfg)):
+            verdicts[i], claims[i] = grade.verdict, grade.unsupported_claims
+        return {"support_verdicts": verdicts, "unsupported_claims": claims}
+
+    def revise_answer(self, state: GraphState) -> GraphState:
+        """Rewrite every not-fully-supported answer to keep only what its chunk supports."""
+        docs, answers = state["relevant_docs"], list(state["answers"])
+        todo = [i for i, v in enumerate(state["support_verdicts"]) if v != "fully_supported"]
+        prompts = [
+            REVISE_PROMPT.format(
+                passage=docs[i].page_content,
+                question=state["question"],
+                answer=answers[i],
+                claims="\n".join(f"- {c}" for c in state["unsupported_claims"][i]) or "- (any)",
+            )
+            for i in todo
+        ]
+        for i, reply in zip(todo, self.llm.batch(prompts, config=self.batch_cfg)):
+            answers[i] = str(reply.content)
+        return {"answers": answers, "revisions": state["revisions"] + 1}
 
     def select_answer(self, state: GraphState) -> GraphState:
-        """Pick the answer to return (first candidate for now)."""
-        answer = state["answers"][0]
-        return {"selected_answer": answer, "final_answer": answer}
+        """Pick the best-supported candidate (ties go to the better-ranked chunk)."""
+        verdicts = state["support_verdicts"]
+        best = max(range(len(verdicts)), key=lambda i: (SUPPORT_RANK[verdicts[i]], -i))
+        answer = state["answers"][best]
+        return {
+            "selected_index": best,
+            "selected_answer": answer,
+            "support": verdicts[best],
+            "final_answer": answer,
+        }
 
     def no_context(self, _state: GraphState) -> GraphState:
         """Honest fallback when no retrieved chunk is relevant."""
@@ -365,6 +456,14 @@ def route_after_relevance(state: GraphState) -> Literal["generate_from_context",
     return "generate_from_context" if state["relevant_docs"] else "no_context"
 
 
+def route_after_support(state: GraphState) -> Literal["revise_answer", "select_answer"]:
+    """Revise only while no candidate is fully supported and revision budget remains."""
+    grounded = "fully_supported" in state["support_verdicts"]
+    if not grounded and state["revisions"] < MAX_REVISIONS:
+        return "revise_answer"
+    return "select_answer"
+
+
 # ---------------------------------------------------------------------------
 # 8. Graph
 # ---------------------------------------------------------------------------
@@ -379,6 +478,8 @@ def build_graph(llm: BaseChatModel | None = None, store: Chroma | None = None) -
     graph.add_node("retrieve", nodes.retrieve)
     graph.add_node("is_relevant", nodes.is_relevant)
     graph.add_node("generate_from_context", nodes.generate_from_context)
+    graph.add_node("is_supported", nodes.is_supported)
+    graph.add_node("revise_answer", nodes.revise_answer)
     graph.add_node("select_answer", nodes.select_answer)
     graph.add_node("no_context", nodes.no_context)
     graph.add_edge(START, "decide_retrieval")
@@ -386,7 +487,9 @@ def build_graph(llm: BaseChatModel | None = None, store: Chroma | None = None) -
     graph.add_edge("generate_direct", END)
     graph.add_edge("retrieve", "is_relevant")
     graph.add_conditional_edges("is_relevant", route_after_relevance)
-    graph.add_edge("generate_from_context", "select_answer")
+    graph.add_edge("generate_from_context", "is_supported")
+    graph.add_conditional_edges("is_supported", route_after_support)
+    graph.add_edge("revise_answer", "is_supported")
     graph.add_edge("select_answer", END)
     graph.add_edge("no_context", END)
     return graph.compile()
@@ -417,9 +520,13 @@ def print_result(result: GraphState) -> None:
     print(f"\nRetrieve? {'yes' if result['needs_retrieval'] else 'no'} ({result['retrieval_reason']})")
     if "relevance" in result:
         print(f"Relevant chunks: {sum(result['relevance'])}/{len(result['relevance'])}")
+    if "support" in result:
+        print(f"Support: {result['support']} (revisions: {result['revisions']})")
     print("\n=== Answer ===")
     print(result["final_answer"])
-    sources = sorted({format_source(d) for d in result.get("relevant_docs", [])})
+    chosen = result.get("selected_index")
+    docs = [result["relevant_docs"][chosen]] if chosen is not None else []
+    sources = sorted({format_source(d) for d in docs})
     if sources:
         print("\nSources: " + "; ".join(sources))
 
