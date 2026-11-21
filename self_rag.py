@@ -676,8 +676,75 @@ def build_graph(llm: BaseChatModel | None = None, store: Chroma | None = None) -
 
 def ask(question: str, graph: Any | None = None) -> GraphState:
     """Run one question through the graph and return the final state."""
+    return ask_with_path(question, graph)[0]
+
+
+def ask_with_path(question: str, graph: Any | None = None) -> tuple[GraphState, list[str]]:
+    """Like `ask`, but also returns the nodes visited, in order."""
+    state: GraphState = {"question": question}
+    path: list[str] = []
     with friendly_errors():
-        return (graph or build_graph()).invoke({"question": question})
+        for update in (graph or build_graph()).stream({"question": question}, stream_mode="updates"):
+            node, delta = next(iter(update.items()))
+            path.append(node)
+            state.update(delta)
+    return state, path
+
+
+# ---------------------------------------------------------------------------
+# 9. Evaluation
+# ---------------------------------------------------------------------------
+
+# (label, question, what we expect, check on the final state)
+EVAL_CASES: list[tuple[str, str, str, Any]] = [
+    (
+        "general knowledge",
+        "What is the capital of France?",
+        "no retrieval",
+        lambda s: not s["needs_retrieval"] and s["useful"],
+    ),
+    (
+        "answerable from documents",
+        "How does a TCP server accept client connections?",
+        "retrieval, supported, useful, no retries",
+        lambda s: s["needs_retrieval"] and s["useful"] and s["retries"] == 0,
+    ),
+    (
+        "poorly phrased",
+        "why write the diary before touching the real data in databases",
+        "at least one query rewrite",
+        lambda s: s["retries"] >= 1,
+    ),
+    (
+        "not in the documents",
+        "What do the documents say about Kubernetes operators for TCP load balancing?",
+        "honest limited-context answer",
+        lambda s: s["limited_context"],
+    ),
+]
+
+
+def run_eval() -> bool:
+    """Run the four sample questions and print the path each one took."""
+    graph = build_graph()
+    all_ok = True
+    for label, question, expectation, check in EVAL_CASES:
+        state, path = ask_with_path(question, graph)
+        ok = bool(check(state))
+        all_ok &= ok
+        print(f"\n[{'PASS' if ok else 'FAIL'}] {label}: {question}")
+        print(f"  expected: {expectation}")
+        print(f"  path:     {' -> '.join(path)}")
+        print(
+            f"  retrieve={state['needs_retrieval']} support={state.get('support', '-')} "
+            f"useful={state.get('useful')} revisions={state['revisions']} "
+            f"retries={state['retries']} limited_context={state['limited_context']}"
+        )
+        if state.get("rewritten_question"):
+            print(f"  rewritten query: {state['rewritten_question']}")
+        print(f"  answer:   {state['final_answer'][:160]!r}")
+    print(f"\n{'All checks passed.' if all_ok else 'Some checks failed.'}")
+    return all_ok
 
 
 # ---------------------------------------------------------------------------
@@ -687,12 +754,13 @@ def ask(question: str, graph: Any | None = None) -> GraphState:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Self-RAG with Groq + Ollama")
-    sub = parser.add_subparsers(dest="command", required=True)
+    sub = parser.add_subparsers(dest="command")
     p_ingest = sub.add_parser("ingest", help="embed documents/ into Chroma")
     p_ingest.add_argument("--force", action="store_true", help="rebuild even if already ingested")
     p_ask = sub.add_parser("ask", help="ask a question")
     p_ask.add_argument("question")
     parser.add_argument("-v", "--verbose", action="store_true", help="log each graph step")
+    parser.add_argument("--eval", action="store_true", help="run the four sample questions")
     return parser
 
 
@@ -714,7 +782,10 @@ def print_result(result: GraphState) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not args.eval and args.command is None:
+        parser.error("choose a command (ingest, ask) or pass --eval")
     logging.basicConfig(
         level=logging.INFO if args.verbose else logging.WARNING,
         format="%(levelname)s %(name)s: %(message)s",
@@ -722,6 +793,8 @@ def main(argv: list[str] | None = None) -> int:
     for noisy in ("httpx", "httpcore", "groq", "chromadb"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
     try:
+        if args.eval:
+            return 0 if run_eval() else 1
         if args.command == "ingest":
             ingest(force=args.force)
         elif args.command == "ask":
