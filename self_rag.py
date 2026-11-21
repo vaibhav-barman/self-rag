@@ -597,7 +597,11 @@ def route_after_usefulness(state: GraphState) -> Literal["__end__", "rewrite_que
 
 def build_graph(llm: BaseChatModel | None = None, store: Chroma | None = None) -> Any:
     """Assemble and compile the LangGraph state machine."""
-    nodes = Nodes(llm or get_llm(), store or get_vector_store())
+    llm = llm or get_llm()
+    store = store or get_vector_store()
+    if collection_size(store) == 0:
+        raise SelfRagError("The vector store is empty. Ingest your documents first (ingest).")
+    nodes = Nodes(llm, store)
     graph = StateGraph(GraphState)
     graph.add_node("decide_retrieval", nodes.decide_retrieval)
     graph.add_node("generate_direct", nodes.generate_direct)
