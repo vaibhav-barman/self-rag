@@ -354,10 +354,13 @@ DECIDE_PROMPT = """You decide whether a question needs a private document collec
 collection contains technical books on: database internals and modern databases, network \
 programming (client/server, sockets), and software development practices.
 
-Retrieve (should_retrieve=true) when the question is about those subjects, asks for specific \
-facts, definitions or details likely found in such books, or refers to "the documents".
-Do not retrieve (should_retrieve=false) for greetings, simple arithmetic, common general \
-knowledge, or topics unrelated to the collection.
+Retrieve (should_retrieve=true) whenever the question is about any of those subjects, even if \
+you already know the answer: answers on these subjects must be grounded in the collection. This \
+includes definitions, concepts, how-things-work and best-practice questions, and anything that \
+refers to "the documents" or "the books".
+Do not retrieve (should_retrieve=false) only when the question is clearly outside those \
+subjects: greetings, arithmetic, creative writing, or general knowledge such as geography, \
+history or science unrelated to the collection.
 
 Question: {question}"""
 
